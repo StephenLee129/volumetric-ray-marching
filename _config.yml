@@ -1,0 +1,12 @@
+remote_theme: abhinavs/moonwalk
+
+theme_config:
+  appearance: "light"
+  appearance_toggle: true 
+
+plugins:
+  - jekyll-feed
+  - jekyll-soopr-seo-tag
+  - jekyll-remote-theme
+
+title: "Optimizing Ray-Marching using CUDA for Volumetric Rendering"
