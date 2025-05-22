@@ -1,161 +1,153 @@
 {% include mathjax.html %}
 
-Video: https://www.youtube.com/watch?v=AUwgjJ61g68
+# Optimizing Ray-Marching using CUDA for Volumetric Rendering
+
+## Introudction
+
+Ray tracing is physically-based rendering technique used in computer graphics to generate realistic images by simulating the way light interacts with objects in a virtual scene. This method works by casting rays from the camera into the scene, and tracking how those rays interact with the objects within the scene itself. A particularly difficult interaction for this method of rendering to handle is interactions between light rays and participating media (materials that allow light to pass through them), and is known as volumetric rendering. Volumetric rendering is critical for rendering realistic clouds, fog, smoke, and other translucent materials. Traditional rendering techniques have difficult producing these effects because they are required to simulate transparency, absorption, and self-shadowing effects rather than a simple bounce off of a surface. This challenge is amplified when considering more complex participating media that have spatially varying densities, which prevent simple analytic visibility computations. The best algorithm to properly capture these fine visual details is known as ray marching, a numerical method that accurately resolves light transport by advancing rays iteratively through thousands of small steps at which the density field is sampled.
 
 <div align="center">
-    <img src="./fig1.png" width="100%">
-    <p><em>Figure 1</em>. Our water model adapts to diverse fluid scenarios such as ocean waves, lava flows, pool ripples, and stylized seas using only simple parameter tweaks.</p>
+    <img src="./fig1.png" width="50%">
+    <p><em>Figure 1</em>. Diagram outlining how the ray marching algorithm works. The blue ray represents the primary ray that is being accumulated for the ray traced output, and the orange rays are shadow rays for self-shadowing effects as light marches along the blue primary ray. Courtesy of [1].</p>
 </div>
 
-## Abstract
+However, while computationally intensive, this ray marching algorithm is inherently parallel. Each step of the ray march involves relatively lightweight calculations, which allows for massive parallelism across GPU cores. In particular, the shadow rays, which are critical in properly modeling self-shadowing effects, can each be massively parallelized on the GPU and be computed in parallel.
 
-Creating a convincing water simulation has traditionally been a difficult task in computer graphics due to its complex behavior and demand for a potentially high level of detail in splashes, foam, and bubbles. This is an especially difficult problem since many applications such as video games demand this realistic effects to be computed and rendered at real-time frame rates. We present a heuristics-based water simulation using Unity that allows for a high level of visual fidelity while still performing at real-time rates. Our simulation contains many of the features that are widely desired, including a realistic surface geometry, realistic lighting effects, buoyancy for physics, and level of detail optimizations to make sure that our simulation can run in real-time and be anti-aliased. With this wide array of features, our model creates a visually appealing, real-time water simulation that is useful for a wide variety of applications. 
+To this end, our project aims to address these challenges by leveraging parallel computation, particularly GPU acceleration, to make volumetric rendering more efficient and practical for complex scenes.
 
-## Introduction
+## Approach
 
-Water simulation is an important problem that has been extensively researched for tasks such as CGI film, video game design, and simulation environments. However, these effects can be very computationally expensive to physically model, so a number of heuristics have been created to circumvent more physically-grounded computations without losing visual fidelity. For cases such as video game design, making it real-time is crucial, and there is currently no standardized way of optimizing it (so different implementations use wildly different techniques based on artistic preference and requirements). We aim to produce a real-time water simulation that contains most of the features which will be widely wanted, including a realistic surface, caustics for visual effect, buoyancy for physics, destruction physics for gameplay, and level-of-detail optimization to make sure that it is still real-time and anti-aliased.
+### Ray-Marching Algorithm
 
-The simulation we present can be broken up into 3 main parts: mesh manipulation, lighting, and buoyancy. The water mesh is manipulated to follow a sum of sine waves with various frequency modifications in the frequency domain by using Fast Fourier Transform (FFT). To achieve real-time performance, the wave calculations have been parallelized by Unity compute shaders so the GPU can be utilized. Custom shaders were written to handle the realistic lighting of the water mesh. Buoyancy was implemented by devising a sampling strategy to approximate volume of an object under the water mesh and apply appropriate physics to push the object up.
+Volumetric ray marching on the GPU proceeds through four stages. In the first stage, we allocate device‐resident buffers for all intermediate data: a per-pixel color accumulation buffer, light source locations, and the volume parameters (\(\sigma_t\), \(\rho\)) defining the medium’s absorption coefficient and density.
 
-## Phase 1 –– The Basics
+In the primary ray march, each camera ray is sampled at uniform intervals \(\Delta s\), which is the distance of the primary ray's entry and exit point divided by the number of ray marches parameter. At each sample point \(\mathbf{x}_i\), we update the remaining transmittance  
+\[
+T \leftarrow T \,\exp\bigl(-\sigma_t\,\rho(\mathbf{x}_i)\,\Delta s\bigr)
+\]  
+and then spawn a shadow ray toward each light source to capture self-shadowing contributions.
 
-In this phase, we implemented a basic working prototype of our water simulation from which we could add the more complex features in the next phase. This involved creating a water mesh which we manipulated using a sum of sine waves to create a convincing wave geometry, as well as some Blinn-Phong shading to give our mesh a simple lighting model with some physical realism.
+Shadow rays are handled in the third stage by launching one CUDA thread per shadow ray all at once. Each thread first intersects the BVH to locate the exit point from the volume, then marches through the medium using the same attenuation rule as primary rays. Light contributions along each shadow path are stored in buffers.
 
-### Water Mesh Creation
+In the final reduction stage, we perform a reduction over all thread-local buffers to combine shadow and primary results into the final per-pixel volumetric shading. To balance performance and quality, shadow rays typically use fewer march steps while primary rays employ finer sampling to mitigate aliasing.appropriate physics to push the object up.
 
-We generate a uniform grid mesh over the $x$–$z$ plane, form triangles for each cell, and recalculate normals. This consistent resolution can cause aliasing at a distance, which is addressed in Phase 2.
+### Bounding Volume Hierarchy (BVH)
+One of the main issues that our ray marching algorithm faced was efficiently computing intersection points between all the rays, primary and shadow rays included, and the geometry of the participating medium in the scene. The models used in our simulation were meshes composed of 1,000s of triangles (often referred to as primitives) that defined the complex geometry of our scenes. Naively, this would mean that for every iterative samples, for every bounce of each ray, a linear search would need to be done across all the primitives in the scene. This obviously does not scale very well for scenes with highly detailed, high-poly models that can easily exceed 1,000,000 primitives. Consequently, we implemented a Bounding Volume Hierarchy (BVH), which can reduce our time complexity from $O(n)$ to $O(logn)$ across the primitives in the scene.
 
-### Simple Sum of Sine Waves
+The BVH that we developed divides the scene into a tree hierarchy of axis-aligned bounding boxes. This tree was constructed by computing a tight bounding box around all the primitives in the scene, and then splitting along the centroid of the longest axis of the bounding box. We then recurse on the these splits until the number of primitives contained within a bounding box was sufficiently low (default $<4$ primitives). Now rather than having to compute an intersection between the ray and all the primitives in the scene, we compute the intersection between the ray and the bounding box, and keep traversing the tree, computing intersections between the ray and the bounding box of the appropriate child node until we reach a leaf where we compute the ray-triangle intersection of the primitives contained within that leaf node.
 
-We compute the GPU displacement map by summing two sine waves and scaling by wind. For UV coordinates $(u,v)\in[0,1]^2$ and time $t$, the height is
-$$
-d(u,v,t)
-= \frac{A}{2}\bigl(\sin(\omega(u + t)) + \cos(\omega(v + t))\bigr)\bigl(w_0 + (w_1 - w_0)\max(0,\hat r\cdot\hat w)\bigr),
-$$
-where $A$ is the wave amplitude, $\omega$ the frequency, $\hat r$ the unit vector from the UV center to the sample point, $\hat w$ the wind direction, and $w_0,w_1$ set the wind‐scaling range. In theory, adding more sine waves increases fidelity, but this approach still can’t capture the full complexity of real fluid waves. In Phase 2, we address 
+## Optimizations and Experimentation
 
-### Blinn-Phong Shading
+### Test Environment
+Our experiments were conducted on the Perlmutter supercomputer, specifically utilizing its GPU and CPU compute nodes to compare performance. For each run, only a single node was allocated to ensure consistency and to isolate the effects of hardware differences. The only node variable changed between tests was the -C flag, which toggled between the CPU and GPU nodes. The only runtime variable for our program which we changed between tests was the -G flag, which toggled between our CPU and GPU implementations. All other parameters were held constant to ensure a fair comparison. This controlled setup allowed us to directly attribute any observed performance differences to the underlying hardware and parallelization strategies rather than to differences in scene setup or algorithmic parameters.
 
-For our initial setup, we implemented a simple Blinn-Phong shading model to provide a reasonably realistic lighting model for our simulation. Blinn-Phong shading approximates how light interacts with a surface by computing an ambient, specular, and diffuse component, to reasonably reproduce a variety of optical phenomena. However, this model is too simplistic to create a visually convincing water effect, as it fails to take into account effects such as reflections, refractions, caustics, and the fact that water is a participating medium. In Phase 2, we implement these additional lighting effects to make our simulation much more visually appealing.
+### BVH on GPU
+
+To make BVH traversal efficient on the GPU, we flattened the hierarchical tree structure into a contiguous linear buffer. This approach enables coalesced memory access and avoids the overhead of pointer chasing, which is inefficient on GPUs. Each node in the flattened buffer contains the bounding box information and indices to its children or contained primitives. Since GPUs do not support recursion efficiently, instead of implementing a recursive BVH traversal, we used an explicit stack managed in local memory within each thread. This iterative approach allows thousands of rays to traverse the BVH in parallel without incurring call stack overhead or risking stack overflows. The primitives themselves are also stored in a contiguous buffer, further improving memory access patterns and throughput.
+
+### GPU Thread Per Shadow Ray
+
+In our ray marching algorithm, each primary ray may generate multiple shadow rays at each step to account for self-shadowing effects. On the GPU, we assign a separate thread to each shadow ray, allowing these computations to proceed entirely in parallel. This design leverages the inherent independence of shadow ray calculations since each shadow ray samples the density field and accumulates transmittance independently of others. By mapping each shadow ray to a CUDA thread, we maximize occupancy and throughput, especially in scenes with many lights or complex volumetric effects. The results from all shadow rays are then accumulated in a reduction step to compute the final light contribution for each primary ray.
+
+### Power Functions
+
+We additionally benchmarked three approaches for computing the exponential attenuation of light in the medium:
+
+1. powf: Fast single-precision power function
+      
+2. pow: Standard double-precision power function 
+
+3. incremental multiplication:  Repeatedly multiplying the attenuation factor at each step.
+
+For small numbers of march steps (i.e., 10-100), powf was the fastest, followed by incremental multiplications, with pow being the slowest. For larger numbers of march steps (i.e., 1000-100,000), powf remained the fastest, but pow overtook incremental multiplication in speed. This is likely because repeated multiplication becomes increasingly expensive as the number of steps grows, while the power functions maintain constant-time complexity regardless of the exponent size.
+
+## Results
+
+### CPU vs. GPU Performance Profile
 
 <div align="center">
     <img src="./fig2.png" width="50%">
-    <p><em>Figure 2</em>. Render for one frame of the phase 1 basic water simulation.</p>
+    <p><em>Figure 2</em>. Tables comparing performance on CPU vs. GPU.</p>
 </div>
 
-## Phase 2 –– Simplification and Extension of Open Source
+The above tables show render times for both CPU and GPU implementations at various march step counts and resolutions. At low march step counts (i.e., 10 or 100), the CPU outperforms the GPU. This is expected, as the overhead of initializing GPU kernels and transferring data outweighs the benefits of parallelism for small workloads. For example, at 10 steps on a 480x260 render, the CPU completes in 5.3 seconds, while the GPU takes almost 14x as long.
 
-Using Gunnell's open source water project as a blueprint and supporting code libraries [1,6], we implemented a simplified FFT‐based water system with single spectrum waves of 4 layers, basic lighting of the environment, a basic foam layer driven by height thresholds and no skybox sampling at runtime. To create a comprehensive water model, we improved three key areas: efficient buoyancy, enhanced lighting features (reflection, refraction, and caustics), and an MIP-mesh to eliminate aliasing at the horizon.
+As the number of march steps increases, the GPU begins to outperform the CPU significantly. At 1,000 steps, the GPU is about 1.4x faster than the CPU, and at 10,000 steps, the CPU cannot complete within our node allocation time while the GPU completes in 306 seconds. This trend is even more pronounced at lower resolutions, where the GPU achieves up to 14x speedup at 10,000 steps.
 
-### Custom Float-Point Buoyancy System
-
-Buoyancy is the upward force exerted on a submerged object, equal to the weight of the displaced fluid, as described by Archimedes' principle. A common baseline implementation constrains objects directly to the fluid height with damping. While efficient, this ignores wave dynamics and lateral forces derived from surface normals. At the other extreme, voxel-based methods approximate the object’s volume and iterate per-frame to determine submerged voxels for force integration. This provides higher fidelity but incurs significant computational cost. We adopt an intermediate approach: a custom Float-Point system that samples discrete points on the mesh surface to estimate buoyant forces. This method reasonably approximates buoyant behavior while maintaining computational efficiency suitable for real-time simulation with thousands objects.
-
-The standard Archimedes' equation is:
-$$
-F_{arch} = \rho_f V_d g
-$$
-
-where $\rho_f$ is the fluid density, $V_d$ is the displaced volume, and $g$ is the gravitational acceleration.
-
-For our model we approximate the displaced volume by sampling \( n \) hand placed discrete float-points on the object's surface:
-
-$$
-\mathbf{F}_{\text{total}} = \sum_{i=1}^{n} A_i (\rho g d_i) \mathbf{n}_i - c v_{y,i} \mathbf{u}
-$$
-
-where $A_i$ is the effective area at float-point $i$, $\rho$ is the fluid density, $g$ is gravitational acceleration, $d_i$ is the submerged depth at point $i$, $\mathbf{n}_i$ is the local fluid normal, $c$ is the damping coefficient, $v_{y,i}$ is the vertical velocity at point $i$, and $\mathbf{u}$ is the global up vector. Damping was introduced to promote stability and enable artistic control over the buoyant response. Effective area was introduced to weight floating points differently, since one point may represent a small region of the model while another covers a much larger area. Submerged depths and normals come from the GPU displacement map and feed Unity’s CPU-side Rigidbody physics. While this adds a small delay, caching the displacement map each frame makes the latency largely imperceptible.
+This inflection point occurs because the GPU's parallelism amortizes the fixed overhead as the computational workload increases, allowing it to process many more rays and shadow rays simultaneously. The figures below further display this trend.
 
 <div align="center">
     <img src="./fig3.png" width="50%">
-    <p><em>Figure 3</em>. Float-Points Placed on Objects.</p>
+    <p><em>Figure 3</em>. This figure plots render time versus march step count for both CPU and GPU implementations for a 100x100 render. The CPU curve rises steeply and quickly becomes infeasible for high step counts, while the GPU curve rises much more slowly, demonstrating its scalability for large workloads.</p>
 </div>
-
-Placing one buoyancy sample at every point in the mesh guarantees that the float‐point set fully represents the surface geometry, but the per‐frame cost of evaluating $\mathbf{F}_{\rm buoy}$ and $\mathbf{F}_{\rm damp}$ at each sample scales as
-$$
-T \;=\; \mathcal{O}\bigl(N_{\rm obj}\times N_{\rm samp}\bigr),
-$$
-where $N_{\rm obj}$ is the number of objects and $N_{\rm samp}$ is the number of float‐points per body. In practice, a small, strategically placed $N_{\rm samp}$ suffices to approximate the buoyant response with high fidelity.
 
 <div align="center">
     <img src="./fig4.png" width="50%">
-    <p><em>Figure 4</em>. Objects floating in water.</p>
+    <p><em>Figure 4</em>. This figure plots render time versus march step count for both CPU and GPU implementations for a 480x360 render. Similarly to that of the 100x100 render, the CPU curve rises steeply and quickly becomes infeasible for high step counts, while the GPU curve rises much more slowly, demonstrating its scalability for large workloads.</p>
 </div>
 
-### Improved Lighting
+Both graphs exhibit a similar shape because they reflect the same underlying computational trends (just with a different render size): the GPU's fixed overhead is only overcome at larger workloads, after which parallelism yields dramatic speedups.
 
-The basic lighting effects using Phong shading do not create very realistic looking water, despite the geometry we have been able to achieve using sum of sine waves. In this next section we implement reflections, refractions, caustics, and water fog adapted from Leon Jovanovic's shaders [2] to work with the geometry model that we've developed.
+### Visual Parity
 
-Reflections were implemented as a simplified Fresnel reflection using Schlick's approximation given as
-
-$$
-R(\theta) = R_0 + (1 - R_0)(1 - \cos\theta)^5
-$$
-
-We take the reflected vector with respect to the water's surface and sample the skybox texture for our scene, and multiply this by our Fresnel effect given by Schlick's approximation to create convincing reflection effects that appropriately change with viewing angle.
+Visual parity between the CPU and GPU implementations' outputs is crucial for correctness. For a given march size and identical scene parameters, the output images from both implementations should be visually indistinguishable. This ensures that the parallelization and GPU-specific optimizations do not introduce artifacts or errors. In our experiments, side-by-side comparisons of renders (i.e., 100 march steps, 10 shadow march steps) confirmed that both CPU and GPU outputs were identical, validating the correctness of our GPU implementation.
 
 <div align="center">
     <img src="./fig5.png" width="50%">
-    <p><em>Figure 5</em>. Close-up view of refractive effects.</p>
+    <p><em>Figure 5</em>. CPU render</p>
 </div>
-
-Refractions were implemented using Du/Dv maps to create an approximated refractive effect using a screen space transformation. This method works by first rendering the background scene, then treating the surface normals of the water surface as a Du/Dv map. We then offset the UV coordinates according to a tunable refraction strength parameter, creating a refractive surface effect by shifting the background texture behind the water surface.
-
-We also implemented caustics, which are patterns of light concentration that are created when light rays are refracted or reflected due to the different wavelengths of light behaving differently. The effect of caustic patterns was created using a caustics texture. We sampled our caustics texture twice using different UV offsets. To create the caustic effect, we separate the RGB components to simulate how different wavelengths of light diffract differently. We apply an additional parameter $s$ to accomplish this separation by modifying the UV coordinates by $(s, s), (s, -s), (-s, -s)$ for the R, G, B channels respectively. We combine these samples component wide samples to create a final sample color, and blend the two full samples that were taken. To animate this effect, we incorporate a time parameter which causes the UV coordinates to shift at a constant rate.
-
-The final lighting effect that we implemented was underwater fog, which accounts for the fact that water is a participating medium that scatters, absorbs, and generally reduces visibility the deeper you go. We achieved this effect by calculating the depth of a fragment below the water surface, by finding the difference between the surface depth, and the background depth relative to the screen. We then sample the color of the background at this fragment, and linearly interpolate between the color of the water and the background color according to another tunable parameter that controls the strength of the water fog.
 
 <div align="center">
     <img src="./fig6.png" width="50%">
-    <p><em>Figure 6</em>. Pool scene showcasing reflections of the sky, refraction of objects at the water surface, caustic patterns, and water fog.</p>
+    <p><em>Figure 6</em>. GPU render.</p>
 </div>
 
-### Mesh Anti-aliasing
+## Limitations and Future Work
 
-It is notable that our basic mesh produces aliasing artifacts near the horizon (vanishing line of the water plane). Specifically, instead of being flat as in real life, the vanishing line often is blurred and composed of a wave-like pixelated pattern. This is because the screen-space wave frequency is $\mathcal\Theta(z)$, where $z$ is the distance to the camera. When this exceeds half of the pixel sampling frequency, by the Nyquist sampling theorem, aliasing will occur. To this end, we propose a method for reducing the resolution of the mesh as the distance to the camera grows. The reduction also has to be gradual and fit with the rendering pattern in order to retain the visual effects. Inspired by mipmapping, we propose halfing the resolution in z-coordinate intervals with power-of-2 sizes, and call it mip-water. As shown in Fig. 7, this allows the water's resolution to be gradually decreased as the distance from the camera increases.
+### Serial Sections and Amdahl's Law
+
+Despite extensive parallelization, some parts of the rendering pipeline remain serial, such as scene setup, BVH construction, and final image compositing. Furthermore, each primary ray's shadow rays depend on its current position along the march path. While shadow rays for a single position can be parallelized, they cannot be computed until the primary ray reaches the corresponding position, creating a temporal serialization where shadow ray batches have to wait for primary ray progress. According to Amdahl's Law, the speedup from parallelization is fundamentally limited by the fraction of the code that must execute serially. As a result, even with infinite GPU resources, the overall speedup would be capped by these serial bottlenecks. Further work could focus on parallelizing or pipelining these sections to push the speedup ceiling even higher.
+
+### Further Kernel Optimizations
+
+Additional GPU kernel optimizations could include:
+
+1. Improving memory coalescing and reducing divergent branches within kernels
+2. Using shared memory for frequently accessed data
+3. Employing warp-level primitives (e.g. reductions, prefix sums, etc.)
+4. Mergin kernels to minimize global memory acesses and reduce kernel launch overhead.
+
+Implementing these optimizations could improve our GPU utilization, bringing our implementation closer to the theoretical peak.
+
+### Further Parallelization
+
+Currently, only ray marching and shadow ray computations are fully parallelized on the GPU. Further speedup could be achieved by parallelizing the entire rendering pipeline at the per-pixel level, assigning each pixel (or even each sample within a pixel) to a separate GPU thread. This would enable full-scene rendering in a single pass, maximizing GPU occupancy and minimizing synchronization overhead.
+
+### Custom Density Functions
+
+Expanding the variety of density functions allows for more realistic and diverse volumetric effects. The current system supports any density function, however, future work could implement physically-inspired density phenomena like smoke, clouds, fire, and fog. These could be parameterized to mimic real-world measurements or artist-driven controls, and could leverage domain warping, layering, or noise-based blending for added realism.
 
 <div align="center">
-    <img src="./fig7.png" width="100%">
-    <p><em>Figure 7</em>. Comparisons w/ and w/o anti-aliasing with mip-water.</p>
+    <img src="./fig7.png" width="50%">
+    <p><em>Figure 7</em>. Custom density function that cuts out a sphere. Non-uniform density exemplifies the need to sample hundreds or thousands of times to prevent aliasing, something our GPU-accelerated implementation handles seamlessly.</p>
 </div>
 
-The antialiasing effects are shown in Fig. 8. As shown, our antialiasing method, while not affecting any of the shading pipeline, is able to produce a visually much more appealing and realistic view of the horizon.
+### Better Pipelining
 
-This has the additional theoretical benefit of optimization by better making use of tesselation, as now the further-away parts of the mesh, which once are too detailed for tesselation, can also take advantage of it. However, in experiments this performance improvement seemed to be negligible.
-
-<div align="center">
-    <img src="./fig8.png" width="50%">
-    <p><em>Figure 8</em>. The mip-water mesh with side length 32.</p>
-</div>
+Improved pipelining would allow the system to overlap computation and data transfer, reducing idle times while waiting for GPU results. For example, while one batch of rays is being processed by the GPU, the CPU could prepare the next batch or handle post-processing tasks. Asynchronous kernel launches and memory transfers, combined with double-buffering, could further minimize latency and maximize hardware utilization.
 
 ## Conclusion
 
-In this paper we present a real-time water simulation using the Unity game engine. We achieved visually appealing, realistic-looking water using sum of sine waves to create convincing geometries, and various lighting effect shaders. Additional physical effects such as buoyancy were implemented to expand our simulation's applicability to more complex scenes with ships and other floating objects. Finally we developed anti-aliasing techniques inspired by MipMaps to provide level of detail optimizations that provide much cleaner horizon views.
+In this project, we implemented and parallelized volumetric rendering from scratch to demonstrate that leveraging GPU parallelism for volumetric ray marching yields substantial performance improvements over CPU-based implementations, especially as the computational workload increases. Our experiments showed that while CPUs can outperform GPUs at low march step counts due to lower overhead, GPUs quickly surpass CPUs as the number of steps grows, achieving speedups of over an order of magnitude for complex scenes and high resolutions. This scalability is a direct result of mapping the inherently parallel tasks of ray and shadow computation onto GPU threads, enabling efficient processing of the massive data and computation demands of realistic volumetric rendering.
 
-## Contributions
+We additionally ensured visual parity between CPU and GPU outputs, confirming the correctness of our parallel implementation. However, our analysis highlighted that certain serial components of the pipeline, such as scene setup, BVH construction, and final image compositing, remain bottlenecks that limit overall speedup according to Amdahl's Law. Addressing these serial sections, along with further GPU kernel optimizations and broader parallelization of the rendering pipeline, are promising avenues for future growth of our project.
 
-Jeremy Fischer - sum of sines, open source implementation, buoyancy
-
-Nicholas Jean - showcase videos/renders, phong shading, lighting, improved caustics
-
-Shiran Yuan - antialiasing and website
-
-Stephen Lee - improved lighting and associated scenes
+Overall, our results validate the effectiveness of GPU acceleration for physically-based volumetric rendering and lay the groundwork for further enhancements in both performance and realism for complex scenes involving participating media like clouds, fog, and smoke.
 
 ## References
 
-[1] Garrett Gunnell. *Water Simulation Project*. Available at: https://github.com/GarrettGunnell/Water.
+[1] C. Wallis. Volumetric Rendering Part 2. https://wallisc.github.io/rendering/2020/05/02/Volumetric-Rendering-Part-2.html, 2020.
 
-[2] Leon Jovanovic. *Unity Water Shader*. Available at: https://github.com/leonjovanovic/water-shader-unity.
+[2] Scratchapixel. Volume Rendering - Introduction to Volume Rendering. https://www.scratchapixel.com/lessons/3d-basic-rendering/volume-rendering-for-developers/intro-volume-rendering.html
 
-[3] NVIDIA Developer. *Effective Water Simulation Physical Models*. In GPU Gems, Part I: Natural Effects, Chapter 1. Available at: https://developer.nvidia.com/gpugems/gpugems/part-i-natural-effects/chapter-1-effective-water-simulation-physical-models.
-
-[4] J. Tessen. *Course Notes on Ocean Wave Spectra*. Clemson University. Available at: https://people.computing.clemson.edu/~jtessen/reports/papers_files/coursenotes2004.pdf.
-
-[5] WikiWaves. *Ocean-Wave Spectra*. Available at: https://wikiwaves.org/Ocean-Wave_Spectra.
-
-[6] iamyoukou. *fftWater*. GitHub repository. Available at: https://github.com/iamyoukou/fftWater.
-
-[7] Jerry Tessendorf. *Simulating Ocean Water*. In *Simulating Nature: Realistic and Interactive Techniques*, SIGGRAPH 2001 Course Notes.
-
-[8] F. J. Gerstner. *Theorie der Wellen*. Abhandlungen der Königlichen Böhmischen Gesellschaft der Wissenschaften; reprinted in Annalen der Physik, 32(8):412–445, 1809.
+[3] CS 184/284A: Computer Graphics and Imaging, Spring 2025. Homework 3: Path Tracer 2. University of California, Berkeley. https://cs184.eecs.berkeley.edu/sp25/hw/hw3/
